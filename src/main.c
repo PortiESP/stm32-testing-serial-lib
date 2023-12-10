@@ -34,41 +34,102 @@
 
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
-#include <string.h>
+#include <libopencm3/cm3/nvic.h>
+#include <libopencm3/cm3/systick.h>
 #include <serial.h>
+
+#define STARTB  '\xAA' // Start byte for communication.
+#define STOPB   '\x55' // Stop byte for communication.
+
+volatile uint32_t millis; // Keeps time reference.
+
+/**
+ * @brief Data struct to send throw the serial port.
+ */
+typedef struct
+{
+    uint32_t time;
+    uint8_t character;
+} data_t;
+
+const uint16_t id = 0xCAFE; // Serial ID, send at startup
+
+/**
+ * @brief Blocking delay
+ * 
+ * @param ms amount of milliseconds.
+ */
+void delay_ms(uint32_t ms);
+
+/**
+ * @brief Sends raw data bytes applying the custom protocol
+ *  _______ _________ ________ ________ _____ ________ ________ ______
+ * | START | N BYTES | BYTE_0 | BYTE_1 | ... | BYTE_N | CHKSUM | STOP |
+ *  ------- --------- -------- -------- ----- -------- -------- ------
+ * @param data pointer to the data to be send.
+ * @param length amount of bytes of the data.
+ * @param start byte that indicates the start of communication.
+ * @param stop byte that indicates the end of the communication.
+ * @return true data was send.
+ * @return false data wasn't send.
+ */
+bool send_protocol(const void *data, const uint8_t length,
+                   const uint8_t start, const uint8_t stop);
 
 int main(void)
 {
-    const char *hi = "Hi, from the BluePill!\r\n";
-    uint32_t hi_len = strlen(hi);
-
     // Setup the system clock
     rcc_clock_setup_in_hse_8mhz_out_72mhz();
 
-    // PC13 (LED) as output:
-    rcc_periph_clock_enable(RCC_GPIOC);
-    gpio_set_mode(GPIOC, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO13);
-    gpio_set(GPIOC, GPIO13);
+    // Systick setup
+    systick_set_clocksource(STK_CSR_CLKSOURCE_AHB_DIV8); // 72M/8 = 9M
+    systick_set_reload(8999); // 9M/9000 = 1k => T = 1ms
+    systick_counter_enable();
+    systick_interrupt_enable();
 
-    // USART1 8,N,1 38400bps
-    serial_begin(USART1, BAUD9600);
+    // Init serial port
+    serial_begin(USART1, BAUD115K2);
 
-    // The amount of bytes puts in the buffer must be equal to the length of the string
-    if (hi_len != serial_puts(USART1, hi))
-        gpio_clear(GPIOC, GPIO13); // ups! ERROR, not enough space in the TX buffer...
+    send_protocol(&id, sizeof(id), STARTB, STOPB);
+
+    data_t myData = {0, 0x20};
 
     while (true)
     {
-        // check if the RX buffer has data
-        if (serial_available(USART1) > 0)
-        {
-            uint8_t c = serial_read(USART1);           // Reading from RX Buffer
-            if (c >= 'A' && c <= 'Z')                  // If it's upper:
-                serial_write(USART1, c + ('a' - 'A')); //      send lower.
-            else if (c >= 'a' && c <= 'z')             // If it's lower:
-                serial_write(USART1, c - ('a' - 'A')); //      send upper.
-            else                                       // something else:
-                serial_write(USART1, c);               //      echo.
-        }
+        send_protocol(&myData, sizeof(data_t), STARTB, STOPB);
+        delay_ms(1000);
+        myData.time = millis;
+        myData.character = (myData.character == 0x7F) ? 0x20 : myData.character + 1;
     }
+}
+
+bool send_protocol(const void *data, const uint8_t length,
+                   const uint8_t start, const uint8_t stop)
+{
+    bool result = false;
+    if (serial_sendable(USART1) > (length + 3))
+    {
+        uint8_t chksum = 0, *p = (uint8_t *)data;
+        for (uint16_t i = 0; i < length; i++)
+            chksum ^= *p++;
+
+        serial_write(USART1, start);
+        serial_write(USART1, length);
+        serial_send_data(USART1, data, length);
+        serial_write(USART1, chksum);
+        serial_write(USART1, stop);
+        result = true;
+    }
+    return result;
+}
+
+void delay_ms(uint32_t ms)
+{
+    uint32_t tm = millis + ms;
+    while (millis < tm);
+}
+
+void sys_tick_handler(void)
+{
+    millis++;
 }
